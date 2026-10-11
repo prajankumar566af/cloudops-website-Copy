@@ -1,10 +1,13 @@
-﻿name: CloudOps Website CI/CD
+
+name: CloudOps Website CI/CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -27,19 +30,23 @@ jobs:
       - name: Test website response
         run: |
           for i in {1..10}; do
-            if curl --fail http://localhost:8081; then
+            if curl --fail --silent --show-error http://localhost:8081/; then
               echo "Website test passed"
               exit 0
             fi
             sleep 2
           done
+
           echo "Website test failed"
           docker logs cloudops-test
           exit 1
 
       - name: Prepare deployment files
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        run: tar -czf website.tar.gz -C site .
+        run: |
+          test -f site/index.html
+          tar -czf website.tar.gz -C site .
+          tar -tzf website.tar.gz
 
       - name: Configure SSH
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -47,17 +54,24 @@ jobs:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          set -eux
+          set -eu
+
+          test -n "$EC2_SSH_KEY"
+          test -n "$EC2_HOST"
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+
           printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
           chmod 600 ~/.ssh/ec2_key
-          echo "Checking SSH key format..."
+
+          echo "Validating SSH private key..."
           ssh-keygen -y -f ~/.ssh/ec2_key > /dev/null
-          echo "SSH key format is valid."
-          echo "Checking host key scan..."
+
+          echo "Scanning EC2 host key..."
           ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts
-          echo "SSH setup completed."
+
+          echo "SSH configuration completed."
 
       - name: Check EC2 SSH connection
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -65,8 +79,12 @@ jobs:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
+          set -eu
+          test -n "$EC2_USER"
+
           ssh -i ~/.ssh/ec2_key \
             -o BatchMode=yes \
+            -o ConnectTimeout=15 \
             "$EC2_USER@$EC2_HOST" \
             'echo "SSH connection successful"'
 
@@ -76,7 +94,58 @@ jobs:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
+          set -eu
+
           scp -i ~/.ssh/ec2_key \
             -o BatchMode=yes \
+            -o ConnectTimeout=15 \
             website.tar.gz \
             "$EC2_USER@$EC2_HOST:/home/ec2-user/website-deploy.tar.gz"
+
+      - name: Deploy website to existing Docker website
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -eu
+
+          ssh -i ~/.ssh/ec2_key \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+
+          ARCHIVE=/home/ec2-user/website-deploy.tar.gz
+          DEPLOY_DIR=/home/ec2-user/cloudops-docker/site
+          STAGE_DIR=$(mktemp -d /home/ec2-user/website-stage.XXXXXX)
+          BACKUP_ROOT=/home/ec2-user/cloudops-backups
+          BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+
+          cleanup() {
+            rm -rf "$STAGE_DIR"
+          }
+          trap cleanup EXIT
+
+          echo "Validating deployment archive..."
+          test -f "$ARCHIVE"
+          tar -tzf "$ARCHIVE" > /dev/null
+          tar -xzf "$ARCHIVE" -C "$STAGE_DIR"
+
+          test -f "$STAGE_DIR/index.html"
+          test -d "$DEPLOY_DIR"
+          test -w "$DEPLOY_DIR"
+
+          echo "Backing up existing website..."
+          mkdir -p "$BACKUP_ROOT"
+          mkdir "$BACKUP_DIR"
+          cp -a "$DEPLOY_DIR/." "$BACKUP_DIR/"
+
+          echo "Deploying new website files..."
+          cp -a "$STAGE_DIR/." "$DEPLOY_DIR/"
+
+          rm -f "$ARCHIVE"
+
+          echo "Website deployment completed."
+          echo "Backup location: $BACKUP_DIR"
+          REMOTE

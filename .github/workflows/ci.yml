@@ -1,4 +1,4 @@
-﻿name: CloudOps Website CI
+﻿name: CloudOps Website CI/CD
 
 on:
   push:
@@ -36,3 +36,41 @@ jobs:
           echo "Website test failed"
           docker logs cloudops-test
           exit 1
+
+      - name: Prepare deployment files
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: tar -czf website.tar.gz -C site .
+
+      - name: Configure SSH
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          ssh-keygen -y -f ~/.ssh/ec2_key > /dev/null
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Check EC2 SSH connection
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o BatchMode=yes \
+            "$EC2_USER@$EC2_HOST" \
+            'echo "SSH connection successful"'
+
+      - name: Upload website archive
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          scp -i ~/.ssh/ec2_key \
+            -o BatchMode=yes \
+            website.tar.gz \
+            "$EC2_USER@$EC2_HOST:/home/ec2-user/website-deploy.tar.gz"

@@ -1,4 +1,3 @@
-
 name: CloudOps Website CI/CD
 
 on:
@@ -15,137 +14,181 @@ permissions:
 
 jobs:
   build-and-test:
+    name: Build and test website
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Docker image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build website image
         run: docker build -t cloudops-website:test .
 
-      - name: Start website container
-        run: docker run -d --name cloudops-test -p 8081:80 cloudops-website:test
-
-      - name: Test website response
+      - name: Test website container
         run: |
-          for i in {1..10}; do
-            if curl --fail --silent --show-error http://localhost:8081/; then
-              echo "Website test passed"
+          set -eu
+          docker run -d --name cloudops-test -p 8081:80 cloudops-website:test
+          trap 'docker rm -f cloudops-test >/dev/null 2>&1 || true' EXIT
+
+          for attempt in {1..10}; do
+            if curl --fail --silent --show-error http://localhost:8081/ -o /tmp/website.html && test -s /tmp/website.html; then
+              echo "Website container test passed."
               exit 0
             fi
             sleep 2
           done
 
-          echo "Website test failed"
+          echo "Website test failed." >&2
           docker logs cloudops-test
           exit 1
 
-      - name: Prepare deployment files
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        run: |
-          test -f site/index.html
-          tar -czf website.tar.gz -C site .
-          tar -tzf website.tar.gz
+  deploy:
+    name: Deploy through AWS SSM
+    needs: build-and-test
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
 
-      - name: Configure SSH
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::462263707846:role/CloudOpsGitHubDeployRole
+          aws-region: ap-south-1
+
+      - name: Prepare SSM deployment command
         env:
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import textwrap
+
+          sha = os.environ["GITHUB_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise ValueError("GITHUB_SHA must be a 40-character commit hash")
+
+          script = textwrap.dedent(r'''
+          set -eu
+          sudo -u ec2-user env DEPLOY_SHA="SHA_PLACEHOLDER" bash -s <<'DEPLOY'
           set -eu
 
-          test -n "$EC2_SSH_KEY"
-          test -n "$EC2_HOST"
-
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
-          chmod 600 ~/.ssh/ec2_key
-
-          echo "Validating SSH private key..."
-          ssh-keygen -y -f ~/.ssh/ec2_key > /dev/null
-
-          echo "Scanning EC2 host key..."
-          ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts
-
-          echo "SSH configuration completed."
-
-      - name: Check EC2 SSH connection
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-        run: |
-          set -eu
-          test -n "$EC2_USER"
-
-          ssh -i ~/.ssh/ec2_key \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            "$EC2_USER@$EC2_HOST" \
-            'echo "SSH connection successful"'
-
-      - name: Upload website archive
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-        run: |
-          set -eu
-
-          scp -i ~/.ssh/ec2_key \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            website.tar.gz \
-            "$EC2_USER@$EC2_HOST:/home/ec2-user/website-deploy.tar.gz"
-
-      - name: Deploy website to existing Docker website
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-        run: |
-          set -eu
-
-          ssh -i ~/.ssh/ec2_key \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
-          set -eu
-
-          ARCHIVE=/home/ec2-user/website-deploy.tar.gz
-          DEPLOY_DIR=/home/ec2-user/cloudops-docker/site
-          STAGE_DIR=$(mktemp -d /home/ec2-user/website-stage.XXXXXX)
-          BACKUP_ROOT=/home/ec2-user/cloudops-backups
+          SHA="$DEPLOY_SHA"
+          ARCHIVE="/tmp/cloudops-website-${SHA}.tar.gz"
+          STAGE_DIR="$(mktemp -d /tmp/cloudops-stage.XXXXXX)"
+          DEPLOY_DIR="/home/ec2-user/cloudops-docker/site"
+          BACKUP_ROOT="/home/ec2-user/cloudops-backups"
           BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
 
           cleanup() {
             rm -rf "$STAGE_DIR"
+            rm -f "$ARCHIVE"
           }
           trap cleanup EXIT
 
-          echo "Validating deployment archive..."
-          test -f "$ARCHIVE"
-          tar -tzf "$ARCHIVE" > /dev/null
-          tar -xzf "$ARCHIVE" -C "$STAGE_DIR"
+          curl -fsSL "https://github.com/prajankumar566af/cloudops-website-Copy/archive/${SHA}.tar.gz" -o "$ARCHIVE"
+          tar -tzf "$ARCHIVE" >/dev/null
+          tar -xzf "$ARCHIVE" --strip-components=1 -C "$STAGE_DIR"
 
-          test -f "$STAGE_DIR/index.html"
-          test -d "$DEPLOY_DIR"
-          test -w "$DEPLOY_DIR"
+          SOURCE_DIR="$STAGE_DIR/site"
+          if [ ! -f "$SOURCE_DIR/index.html" ]; then
+            echo "Expected source file not found: $SOURCE_DIR/index.html" >&2
+            exit 1
+          fi
+          if [ ! -d "$DEPLOY_DIR" ] || [ ! -w "$DEPLOY_DIR" ]; then
+            echo "Existing deployment directory is missing or not writable: $DEPLOY_DIR" >&2
+            exit 1
+          fi
 
-          echo "Backing up existing website..."
           mkdir -p "$BACKUP_ROOT"
-          mkdir "$BACKUP_DIR"
+          BACKUP_DIR="$(mktemp -d "$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S).XXXXXX")"
           cp -a "$DEPLOY_DIR/." "$BACKUP_DIR/"
+          cp -a "$SOURCE_DIR/." "$DEPLOY_DIR/"
 
-          echo "Deploying new website files..."
-          cp -a "$STAGE_DIR/." "$DEPLOY_DIR/"
-
-          rm -f "$ARCHIVE"
-
-          echo "Website deployment completed."
+          echo "Deployment completed successfully."
           echo "Backup location: $BACKUP_DIR"
-          REMOTE
+          DEPLOY
+          ''').strip()
+
+          script = script.replace("SHA_PLACEHOLDER", sha)
+          with open("ssm-parameters.json", "w", encoding="utf-8") as parameters_file:
+              json.dump({"commands": [script]}, parameters_file)
+          PY
+
+      - name: Deploy website through SSM
+        env:
+          EC2_INSTANCE_ID: i-0c394a0fcbe2a9532
+        run: |
+          set -eu
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region ap-south-1 \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy website commit $GITHUB_SHA" \
+            --parameters file://ssm-parameters.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          if [ -z "$COMMAND_ID" ] || [ "$COMMAND_ID" = "None" ]; then
+            echo "SSM did not return a command ID." >&2
+            exit 1
+          fi
+          echo "SSM command ID: $COMMAND_ID"
+
+          ERROR_FILE=$(mktemp)
+          trap 'rm -f "$ERROR_FILE"' EXIT
+
+          for attempt in {1..36}; do
+            if STATUS=$(aws ssm get-command-invocation \
+              --region ap-south-1 \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>"$ERROR_FILE"); then
+              if [ -z "$STATUS" ] || [ "$STATUS" = "None" ]; then
+                echo "SSM returned an empty command status." >&2
+                exit 1
+              fi
+            elif grep -Fq "InvocationDoesNotExist" "$ERROR_FILE"; then
+              STATUS=Pending
+            else
+              cat "$ERROR_FILE" >&2
+              exit 1
+            fi
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --region ap-south-1 \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated|InvalidPlatform|AccessDenied|NoInstancesInTag)
+                aws ssm get-command-invocation \
+                  --region ap-south-1 \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query "[StandardOutputContent,StandardErrorContent]" \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for the SSM deployment command." >&2
+          exit 1
